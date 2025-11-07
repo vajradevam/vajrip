@@ -1,0 +1,238 @@
+/**
+ * @file icmp.c
+ * @brief ICMP (Internet Control Message Protocol) implementation
+ * 
+ * Implements ICMP message handling for network diagnostics, error reporting,
+ * and control messages. Handles Echo Request/Reply and other ICMP message types.
+ */
+
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+#include "util.h"
+#include "ip.h"
+#include "icmp.h"
+
+/* Maximum ICMP message size (limited by IP payload size) */
+#define ICMP_BUFSIZ IP_PAYLOAD_SIZE_MAX
+
+/**
+ * @brief Generic ICMP message header structure
+ */
+struct icmp_hdr {
+    uint8_t type;     /* ICMP message type */
+    uint8_t code;     /* ICMP message code */
+    uint16_t sum;     /* Checksum of ICMP header and data */
+    uint32_t values;  /* Type-specific values */
+};
+
+/**
+ * @brief ICMP Echo Request/Reply message structure
+ */
+struct icmp_echo {
+    uint8_t type;     /* ICMP message type */
+    uint8_t code;     /* ICMP message code */
+    uint16_t sum;     /* Checksum */
+    uint16_t id;      /* Identifier */
+    uint16_t seq;     /* Sequence number */
+};
+
+/**
+ * @brief Convert ICMP type to string representation
+ * @param type ICMP message type
+ * @return String description of the ICMP type
+ */
+static char *icmp_type_ntoa(uint8_t type)
+{
+    switch (type) {
+    case ICMP_TYPE_ECHOREPLY:
+        return "EchoReply";
+    case ICMP_TYPE_DEST_UNREACH:
+        return "DestinationUnreachable";
+    case ICMP_TYPE_SOURCE_QUENCH:
+        return "SourceQuench";
+    case ICMP_TYPE_REDIRECT:
+        return "Redirect";
+    case ICMP_TYPE_ECHO:
+        return "Echo";
+    case ICMP_TYPE_TIME_EXCEEDED:
+        return "TimeExceeded";
+    case ICMP_TYPE_PARAM_PROBLEM:
+        return "ParameterProblem";
+    case ICMP_TYPE_TIMESTAMP:
+        return "Timestamp";
+    case ICMP_TYPE_TIMESTAMPREPLY:
+        return "TimestampReply";
+    case ICMP_TYPE_INFO_REQUEST:
+        return "InformationRequest";
+    case ICMP_TYPE_INFO_REPLY:
+        return "InformationReply";
+    }
+    return "Unknown";
+}
+
+/**
+ * @brief Dump ICMP packet contents for debugging
+ * @param data Pointer to ICMP packet data
+ * @param len Length of ICMP packet data
+ */
+static void icmp_dump(const uint8_t *data, size_t len)
+{
+    struct icmp_hdr *hdr;
+    struct icmp_echo *echo;
+
+    flockfile(stderr);
+    hdr = (struct icmp_hdr *)data;
+    
+    fprintf(stderr, "       type: %u (%s)\n", hdr->type, icmp_type_ntoa(hdr->type));
+    fprintf(stderr, "       code: %u\n", hdr->code);
+    fprintf(stderr, "        sum: 0x%04x (0x%04x)\n", 
+            ntoh16(hdr->sum), 
+            ntoh16(cksum16((uint16_t *)data, len, -hdr->sum)));
+    
+    /* Display type-specific fields */
+    switch (hdr->type) {
+    case ICMP_TYPE_ECHOREPLY:
+    case ICMP_TYPE_ECHO:
+        echo = (struct icmp_echo *)hdr;
+        fprintf(stderr, "         id: %u\n", ntoh16(echo->id));
+        fprintf(stderr, "        seq: %u\n", ntoh16(echo->seq));
+        break;
+    default:
+        fprintf(stderr, "     values: 0x%08x\n", ntoh32(hdr->values));
+        break;
+    }
+    
+#ifdef HEXDUMP
+    hexdump(stderr, data, len);
+#endif
+    funlockfile(stderr);
+}
+
+/* ============================================================================
+ * ICMP Packet Processing Functions
+ * ============================================================================
+
+/**
+ * @brief Process incoming ICMP packets
+ * @param data Pointer to ICMP packet data
+ * @param len Length of ICMP packet data
+ * @param src Source IP address
+ * @param dst Destination IP address
+ * @param iface Network interface that received the packet
+ */
+static void icmp_input(const uint8_t *data, size_t len, ip_addr_t src, 
+                      ip_addr_t dst, struct ip_iface *iface)
+{
+    struct icmp_hdr *hdr;
+    char addr1[IP_ADDR_STR_LEN];
+    char addr2[IP_ADDR_STR_LEN];
+    char addr3[IP_ADDR_STR_LEN];
+
+    /* Validate packet length */
+    if (len < sizeof(*hdr)) {
+        errorf("too short");
+        return;
+    }
+    
+    hdr = (struct icmp_hdr *)data;
+    
+    /* Verify ICMP checksum */
+    if (cksum16((uint16_t *)data, len, 0) != 0) {
+        errorf("checksum error, sum=0x%04x, verify=0x%04x", 
+               ntoh16(hdr->sum), 
+               ntoh16(cksum16((uint16_t *)data, len, -hdr->sum)));
+        return;
+    }
+    
+    debugf("%s => %s, type=%s(%u), len=%zu, iface=%s",
+           ip_addr_ntop(src, addr1, sizeof(addr1)),
+           ip_addr_ntop(dst, addr2, sizeof(addr2)),
+           icmp_type_ntoa(hdr->type), hdr->type, len,
+           ip_addr_ntop(iface->unicast, addr3, sizeof(addr3)));
+    icmp_dump(data, len);
+    
+    /* Process ICMP message based on type */
+    switch (hdr->type) {
+    case ICMP_TYPE_ECHO:
+        /* Handle Echo Request (ping) */
+        if (dst != iface->unicast) {
+            /* 
+             * Message addressed to broadcast address.
+             * Respond with the address of the received interface.
+             */
+            dst = iface->unicast;
+        }
+        /* Send Echo Reply with same data payload */
+        icmp_output(ICMP_TYPE_ECHOREPLY, hdr->code, hdr->values,
+                   (uint8_t *)(hdr + 1), len - sizeof(*hdr), dst, src);
+        break;
+        
+    default:
+        /* Ignore unsupported ICMP message types */
+        break;
+    }
+}
+
+/* ============================================================================
+ * Public ICMP Interface Functions
+ * ============================================================================
+
+/**
+ * @brief Send an ICMP message
+ * @param type ICMP message type
+ * @param code ICMP message code
+ * @param values Type-specific values
+ * @param data Pointer to ICMP message payload
+ * @param len Length of payload data
+ * @param src Source IP address
+ * @param dst Destination IP address
+ * @return 0 on success, -1 on failure
+ */
+int icmp_output(uint8_t type, uint8_t code, uint32_t values,
+               const uint8_t *data, size_t len, ip_addr_t src, ip_addr_t dst)
+{
+    uint8_t buf[ICMP_BUFSIZ];
+    struct icmp_hdr *hdr;
+    size_t msg_len;
+    char addr1[IP_ADDR_STR_LEN];
+    char addr2[IP_ADDR_STR_LEN];
+
+    /* Construct ICMP message header */
+    hdr = (struct icmp_hdr *)buf;
+    hdr->type = type;
+    hdr->code = code;
+    hdr->sum = 0;  /* Calculate checksum later */
+    hdr->values = values;
+    
+    /* Copy payload data after header */
+    memcpy(hdr + 1, data, len);
+    msg_len = sizeof(*hdr) + len;
+    
+    /* Calculate and set ICMP checksum */
+    hdr->sum = cksum16((uint16_t *)hdr, msg_len, 0);
+    
+    debugf("%s => %s, type=%s(%u), len=%zu",
+           ip_addr_ntop(src, addr1, sizeof(addr1)),
+           ip_addr_ntop(dst, addr2, sizeof(addr2)),
+           icmp_type_ntoa(hdr->type), hdr->type, msg_len);
+    icmp_dump((uint8_t *)hdr, msg_len);
+    
+    /* Send via IP layer */
+    return ip_output(IP_PROTOCOL_ICMP, (uint8_t *)hdr, msg_len, src, dst);
+}
+
+/**
+ * @brief Initialize the ICMP protocol module
+ * @return 0 on success, -1 on failure
+ */
+int icmp_init(void)
+{
+    /* Register ICMP protocol handler with IP layer */
+    if (ip_protocol_register("ICMP", IP_PROTOCOL_ICMP, icmp_input) == -1) {
+        errorf("ip_protocol_register() failure");
+        return -1;
+    }
+    return 0;
+}
