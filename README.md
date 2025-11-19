@@ -255,13 +255,7 @@ nc 192.0.2.2 7
 nc -u 192.0.2.2 7
 ```
 
-### Automated Tests
-```bash
-make test
-./test/protocol_test.exe
-```
-
-## Learning Resources
+## Resources
 
 ### Protocol References
 - [RFC 791](https://tools.ietf.org/html/rfc791) - Internet Protocol
